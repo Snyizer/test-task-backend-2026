@@ -1,5 +1,6 @@
+import inspect
 import time
-from typing import Type, Any, Iterator
+from typing import Any, Iterator, Type
 
 import requests
 
@@ -49,6 +50,7 @@ class AmoCrmError(Exception):
     def __init__(self, msg=None, error_code=None):
         self.error_code = error_code
         self.error_description = self.errors.get(str(error_code), f'Undescribed error: {error_code}')
+        self.error_description = self.errors.get(str(error_code), f"Undescribed error: {error_code}")
         self.msg = f"{msg or 'AmoCRM error'}, {self.error_description}"
         super().__init__(self.msg)
 
@@ -57,6 +59,93 @@ class AmoCrmCompaniesMoreThanOne(Exception):
     """
     amocrm error when found companies > 1
     """
+
+
+def normalize_custom_fields(raw: Any) -> dict:
+    """Приводит custom_fields_values API к словарю {имя: {id, value}}."""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        normalized = {}
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                normalized[key] = value
+            else:
+                normalized[key] = {"value": value}
+        return normalized
+    if not isinstance(raw, list):
+        return {}
+
+    normalized = {}
+    for field in raw:
+        if not isinstance(field, dict):
+            continue
+        name = field.get("field_name") or field.get("field_code") or field.get("name")
+        if not name:
+            continue
+        values = field.get("values") or []
+        value = None
+        if isinstance(values, list) and values and isinstance(values[0], dict):
+            value = values[0].get("value")
+        elif "value" in field:
+            value = field.get("value")
+        normalized[name] = {"id": field.get("field_id", field.get("id")), "value": value}
+    return normalized
+
+
+def should_fetch_next_page(counter: int, limit: int, page, next_href) -> bool:
+    """Полная страница без ссылки next — конец выборки, а не ошибка."""
+    if page or counter < limit or not next_href:
+        return False
+    return True
+
+
+def next_page_href(json_data: dict):
+    links = json_data.get("_links") or {}
+    nxt = links.get("next")
+    if not isinstance(nxt, dict):
+        return None
+    return nxt.get("href") or None
+
+
+def _assign_embedded(entity, embedded, with_tags=False):
+    entity.companies = []
+    entity.contacts = []
+    if with_tags:
+        entity.tags = []
+    if not embedded:
+        return
+    if embedded.get(COMPANIES):
+        entity.companies = embedded.get(COMPANIES)
+    if embedded.get(CONTACTS):
+        entity.contacts = embedded.get(CONTACTS)
+    if with_tags and embedded.get(TAGS):
+        entity.tags = embedded.get(TAGS)
+
+
+class _EntitySchema:
+    def __init__(self, obj_cls: Type["BaseEntity"], many: bool = False):
+        self.obj_cls = obj_cls
+        self.many = many
+
+    def load(self, data):
+        if self.many:
+            return [self._one(item) for item in data]
+        return self._one(data)
+
+    def _one(self, item):
+        payload = dict(item or {})
+        payload["custom_fields_values"] = normalize_custom_fields(payload.get("custom_fields_values"))
+        signature = inspect.signature(self.obj_cls.__init__)
+        kwargs = {}
+        for name, param in signature.parameters.items():
+            if name == "self":
+                continue
+            if name in payload:
+                kwargs[name] = payload[name]
+            elif param.default is inspect.Parameter.empty:
+                kwargs[name] = None
+        return self.obj_cls(**kwargs)
 
 
 class BaseEntity:
@@ -75,10 +164,26 @@ class BaseEntity:
     def __repr__(self):
         return str(self)
 
+    @classmethod
+    def get_schema(cls, many: bool = False) -> _EntitySchema:
+        return _EntitySchema(cls, many=many)
+
+    def as_dict(self) -> dict:
+        return {key: value for key, value in self.__dict__.items() if not key.startswith("_")}
+
     def get_field(self, field_name):
-        return self.custom_fields_values.get(field_name, {}).get('value')
+        fields = self.custom_fields_values
+        if not isinstance(fields, dict):
+            fields = normalize_custom_fields(fields)
+            self.custom_fields_values = fields
+        field = fields.get(field_name) or {}
+        if isinstance(field, dict):
+            return field.get('value')
+        return None
 
     def set_field(self, field_name, field_value, field_id=None):
+        if not isinstance(self.custom_fields_values, dict):
+            self.custom_fields_values = normalize_custom_fields(self.custom_fields_values)
         custom_field = self.custom_fields_values.get(field_name)
         if custom_field is None:
             if field_id is None:
@@ -142,18 +247,10 @@ class Customer(BaseEntity):
         self.purchases_count = purchases_count
         self.average_check = average_check
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = custom_fields_values if isinstance(custom_fields_values, dict) else normalize_custom_fields(custom_fields_values)
         self._embedded = _embedded
-
-        self.companies = []
-        self.contacts = []
         self._new_next_date = None
-        if not _embedded:
-            return
-        if _embedded.get(COMPANIES):
-            self.companies = _embedded.get(COMPANIES)
-        if _embedded.get(CONTACTS):
-            self.contacts = _embedded.get(CONTACTS)
+        _assign_embedded(self, _embedded)
 
 
 class Lead(BaseEntity):
@@ -200,13 +297,9 @@ class Lead(BaseEntity):
         self.is_deleted = is_deleted
         self.score = score
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = custom_fields_values if isinstance(custom_fields_values, dict) else normalize_custom_fields(custom_fields_values)
         self._embedded = _embedded
-        self.tags = []
-        self.contacts = []
-        self.companies = []
-        if not _embedded:
-            return
+        _assign_embedded(self, _embedded, with_tags=True)
 
 
 def amocrm_get(obj_cls: Type[BaseEntity],
@@ -223,9 +316,9 @@ def amocrm_get(obj_cls: Type[BaseEntity],
         params['limit'] = limit
     if _filter:
         for key, value in _filter.items():
-            filter_key = f'filter[{key}]'
+            filter_key = f"filter[{key}]"
             if isinstance(value, list):
-                filter_key = f'{filter_key}[]'
+                filter_key = f"{filter_key}[]"
             params[filter_key] = value
     if _with:
         if isinstance(_with, list):
@@ -233,7 +326,7 @@ def amocrm_get(obj_cls: Type[BaseEntity],
         else:
             params['with'] = _with
     if query:
-        params[f'query'] = query
+        params['query'] = query
 
     headers = {}
     base_url = ""
@@ -281,13 +374,12 @@ def amocrm_get(obj_cls: Type[BaseEntity],
                     yield entity
 
             # condition to stop while loop
-            if page:
-                break
-            if counter < limit:
+            href = next_page_href(json_data)
+            if not should_fetch_next_page(counter, limit, page, href):
                 break
             time.sleep(1)
             # reset url and params for page iteration
-            url = json_data['_links']['next']['href']
+            url = href
             params = {}
 
 
