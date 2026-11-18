@@ -1,8 +1,9 @@
 import logging
 from collections import Counter, defaultdict
-from typing import Dict, Iterable, List, Optional
+from itertools import islice
+from typing import Dict, Iterable, List, Optional, TypeVar
 
-from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy import column, delete, exists, func, select, update, values
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from amocrm import Customer, Lead
@@ -11,6 +12,7 @@ from models import AmoCustomer, AmoLead, AbstractCustomer
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 2000
+T = TypeVar("T")
 
 
 def marked_for_deletion(name) -> bool:
@@ -71,9 +73,10 @@ def embed_document(raw, kind: str) -> Optional[dict]:
     return {'general': general, "api_value": raw}
 
 
-def _batches(rows: List[dict], size: int = BATCH_SIZE) -> Iterable[List[dict]]:
-    for start in range(0, len(rows), size):
-        yield rows[start:start + size]
+def _batches(rows: Iterable[T], size: int = BATCH_SIZE) -> Iterable[List[T]]:
+    iterator = iter(rows)
+    while batch := list(islice(iterator, size)):
+        yield batch
 
 
 class SyncGraph:
@@ -321,7 +324,7 @@ def _merge_embeds(existing, fresh: dict) -> list:
     return list(merged.values())
 
 
-def _insert_roots(session, rows: List[dict]) -> List[int]:
+def _insert_roots(session, rows: Iterable[dict]) -> List[int]:
     # Pass rows at execution time so SQLAlchemy can batch the insert and
     # correlate returned IDs with the input order.
     stmt = pg_insert(AbstractCustomer.__table__).returning(
@@ -334,9 +337,7 @@ def _insert_roots(session, rows: List[dict]) -> List[int]:
     return inserted
 
 
-def _upsert(session, model, rows: List[dict]):
-    if not rows:
-        return
+def _upsert(session, model, rows: Iterable[dict]):
     for batch in _batches(rows):
         stmt = pg_insert(model).values(batch)
         excluded = stmt.excluded
@@ -354,6 +355,39 @@ def _upsert(session, model, rows: List[dict]):
         session.execute(stmt)
 
 
+def _update_roots(session, rows: Iterable[tuple], run_id: int):
+    root = AbstractCustomer.__table__
+    for batch in _batches(rows):
+        incoming = values(
+            column('id', root.c.id.type),
+            column('amo_contacts', root.c.amo_contacts.type),
+            column('amo_companies', root.c.amo_companies.type),
+            name='incoming',
+        ).data(batch)
+        session.execute(
+            update(root)
+            .where(root.c.id == incoming.c.id)
+            .values(
+                amo_contacts=incoming.c.amo_contacts,
+                amo_companies=incoming.c.amo_companies,
+                last_seen_run=run_id,
+            )
+        )
+
+
+def _entity_rows(graph, accepted, id_map, run_id):
+    for crm_id, payload in accepted.items():
+        yield {
+            "abstract_customer_id": id_map[graph.find(payload["abstract_id"])],
+            "crm_id": crm_id,
+            "login": payload["login"],
+            "name": payload["name"],
+            "general": payload["general"],
+            "api_value": payload["api_value"],
+            "last_seen_run": run_id,
+        }
+
+
 def persist_sync(session, graph: SyncGraph, is_full: bool):
     """Пишет граф одной транзакцией. Удаление только после полного прохода."""
     current = session.scalar(select(func.max(AbstractCustomer.last_seen_run)))
@@ -364,14 +398,14 @@ def persist_sync(session, graph: SyncGraph, is_full: bool):
 
     new_roots = [root for root in roots if root < 0]
     if new_roots:
-        payloads = [
+        payloads = (
             {
                 "amo_contacts": _embed_list(contacts.get(root, {})),
                 "amo_companies": _embed_list(companies.get(root, {})),
                 "last_seen_run": run_id,
             }
             for root in new_roots
-        ]
+        )
         new_ids = _insert_roots(session, payloads)
         if len(new_ids) != len(new_roots):
             raise RuntimeError("Postgres вернул не все id новых покупателей")
@@ -387,52 +421,23 @@ def persist_sync(session, graph: SyncGraph, is_full: bool):
     else:
         stored_map = {}
 
-    updates = []
-    for root in existing_roots:
-        fresh_contacts = contacts.get(root, {})
-        fresh_companies = companies.get(root, {})
-        if is_full:
-            amo_contacts = _embed_list(fresh_contacts)
-            amo_companies = _embed_list(fresh_companies)
-        else:
-            row = stored_map.get(root)
-            amo_contacts = _merge_embeds(getattr(row, "amo_contacts", None), fresh_contacts)
-            amo_companies = _merge_embeds(getattr(row, "amo_companies", None), fresh_companies)
-        updates.append({
-            "id": root,
-            "amo_contacts": amo_contacts,
-            "amo_companies": amo_companies,
-            "last_seen_run": run_id,
-        })
-    if updates:
-        session.execute(update(AbstractCustomer), updates)
+    def root_updates():
+        for root in existing_roots:
+            fresh_contacts = contacts.get(root, {})
+            fresh_companies = companies.get(root, {})
+            if is_full:
+                yield root, _embed_list(fresh_contacts), _embed_list(fresh_companies)
+            else:
+                row = stored_map.get(root)
+                yield (
+                    root,
+                    _merge_embeds(getattr(row, "amo_contacts", None), fresh_contacts),
+                    _merge_embeds(getattr(row, "amo_companies", None), fresh_companies),
+                )
 
-    customer_rows = []
-    for crm_id, payload in graph.accepted_customers.items():
-        root = graph.find(payload["abstract_id"])
-        customer_rows.append({
-            "abstract_customer_id": id_map[root],
-            "crm_id": crm_id,
-            "login": payload["login"],
-            "name": payload["name"],
-            "general": payload["general"],
-            "api_value": payload["api_value"],
-            "last_seen_run": run_id,
-        })
-    lead_rows = []
-    for crm_id, payload in graph.accepted_leads.items():
-        root = graph.find(payload["abstract_id"])
-        lead_rows.append({
-            "abstract_customer_id": id_map[root],
-            "crm_id": crm_id,
-            "login": payload["login"],
-            "name": payload["name"],
-            "general": payload["general"],
-            "api_value": payload["api_value"],
-            "last_seen_run": run_id,
-        })
-    _upsert(session, AmoCustomer, customer_rows)
-    _upsert(session, AmoLead, lead_rows)
+    _update_roots(session, root_updates(), run_id)
+    _upsert(session, AmoCustomer, _entity_rows(graph, graph.accepted_customers, id_map, run_id))
+    _upsert(session, AmoLead, _entity_rows(graph, graph.accepted_leads, id_map, run_id))
 
     if not is_full:
         return
